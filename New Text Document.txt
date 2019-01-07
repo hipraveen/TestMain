@@ -1,0 +1,1521 @@
+package com.abc.data.workflow.service;
+
+import java.nio.charset.StandardCharsets;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import javax.validation.ConstraintViolation;
+import javax.validation.Validation;
+import javax.validation.Validator;
+import javax.validation.ValidatorFactory;
+
+import org.apache.commons.lang3.BooleanUtils;
+import org.apache.http.HttpStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.ResponseEntity;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.util.CollectionUtils;
+import org.springframework.util.StringUtils;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
+import org.springframework.web.multipart.MultipartFile;
+
+import com.abc.api.exception.model.ErrorModel;
+import com.abc.api.exception.model.ExceptionTypeEnum;
+import com.abc.api.request.exception.InvalidRequestException;
+import com.abc.api.request.exception.NotFoundException;
+import com.abc.api.request.exception.ValidationException;
+import com.abc.data.DocketDescriptorModel;
+import com.abc.data.RecordsAnalysisRequestModel;
+import com.abc.data.WorkflowFailureModel;
+import com.abc.data.casedata.client.CaseClient;
+import com.abc.data.casedata.entity.CaseDataEntity;
+import com.abc.data.casedata.entity.CriminalChargesEntity;
+import com.abc.data.casedata.entity.CriminalSentenceEntity;
+import com.abc.data.casedata.entity.NoteEntryEntity;
+import com.abc.data.casedata.entity.RecordAnalysisEntity;
+import com.abc.data.casedata.entity.SearchStatusEnum;
+import com.abc.data.casedata.entity.TableResponseEntity;
+import com.abc.data.courtdata.client.CourtClientService;
+import com.abc.data.courtdata.model.CourtAxisStatus;
+import com.abc.data.exception.RequestParserException;
+import com.abc.data.exception.UnauthorizedException;
+import com.abc.data.exception.WorkflowForbiddenException;
+import com.abc.data.model.WebooksVendorModel;
+import com.abc.data.model.WorkerRequestModel;
+import com.abc.data.searchinfo.client.SearchInfoClientServices;
+import com.abc.data.searchinfo.entity.SearchHeaderEntity;
+import com.abc.data.searchinfo.model.NoteEntryModel;
+import com.abc.data.searchinfo.model.SearchDetails;
+import com.abc.data.searchinfo.model.SearchUpdatesModel;
+import com.abc.data.triton.mvr.model.TritonMVRPackageResultModel;
+import com.abc.data.utils.PasswordManager;
+import com.abc.data.utils.PublishSQSMessageUtils;
+import com.abc.data.vendor.client.VendorClient;
+import com.abc.data.vendor.entity.VenderUpdateApiAndTokenRequestEntity;
+import com.abc.data.vendor.entity.VendorEntity;
+import com.abc.data.vendor.entity.WebhooksVendorRequestEntity;
+import com.abc.data.vendor.model.CompletedUpdatesModel;
+import com.abc.data.vendor.model.FailedUpdatesModel;
+import com.abc.data.vendor.model.UpdateResponseModel;
+import com.abc.data.vendor.model.VndCaseDataModel;
+import com.abc.data.vendor.model.VndCriminalAdditionModel;
+import com.abc.data.vendor.model.VndCriminalChargeModel;
+import com.abc.data.vendor.model.VndCriminalSentenceModel;
+import com.abc.data.vendor.model.VndSearchEntityAssembler;
+import com.abc.data.vendor.model.VndSearchModel;
+import com.abc.data.vendor.model.VndSearchResponseModel;
+import com.abc.data.vendor.model.VndSearchUpdateAssembler;
+import com.abc.data.vendor.model.VndSearchUpdateModel;
+import com.abc.data.vendor.model.VndSearchUpdateRequestModel;
+import com.abc.data.workflow.client.SearchWorkflowClientService;
+import com.abc.data.workflow.entity.DocketDescriptorEntity;
+import com.abc.data.workflow.entity.MvrResultsEntity;
+import com.abc.data.workflow.entity.NoteUpdateEntity;
+import com.abc.data.workflow.entity.SearchWorkflowEntity;
+import com.abc.data.workflow.entity.SearchWorkflowResponseEntity;
+import com.abc.data.workflow.entity.WorkerActionEnum;
+import com.abc.data.workflow.entity.WorkflowStatusEnum;
+import com.abc.data.workflow.entity.WorkflowUpdateEntity;
+import com.abc.data.workfusion.WorkFusionException;
+import com.abc.document.client.DocumentStorageClientService;
+import com.abc.document.entity.DocumentEntity;
+import com.abc.vis.util.DateConverterUtil;
+
+/**
+ * Implements service methods for the Workflow Integration Service.
+ *
+ * @author rguck
+ *
+ */
+@Service
+@Transactional
+public class WorkflowServiceImpl implements WorkflowService {
+    private static final long MILLIS_IN_ONE_MINUTE = 1000 * 60;
+
+    public static final String VENDOR_INTEGRATION = "vendor-integration";
+
+    private static final String LEVEL_CASE = "case";
+
+    private static final String LEVEL_CRIMINAL_CHARGE = "criminal_charges";
+
+    private static Logger LOG = LoggerFactory.getLogger(WorkflowServiceImpl.class);
+
+    @Value("${aws.sqs.worker.queue}")
+    private String workerQueue;
+
+    @Value("${researcher.workfusion.vendor_id}")
+    private Integer vendorId;
+
+    @Value("${researcher.workfusion.researcher_type}")
+    private String workfusionResearcherType;
+
+    @Value("${vendor.search.defaultPage}")
+    private Integer defaultPage;
+
+    @Value("${dat-documentstorage.protocol}")
+    private String dssProtocol;
+
+    @Value("${dat-documentstorage.ribbon.listOfServers}")
+    private String dssListOfServers;
+
+    @Value("${dat-documentstorage.contextPath}")
+    private String dssContextPath;
+
+    @Value("${researcher.workfusion.rule_log.document_type}")
+    private String workfusionDocumentType;
+
+    @Autowired
+    private CourtClientService courtClientService;
+
+    @Autowired
+    private SearchInfoClientServices searchInfoClientService;
+
+    @Autowired
+    private SearchWorkflowClientService searchWorkflowClientService;
+
+    @Autowired
+    private PublishSQSMessageUtils publishSQSMessageUtils;
+
+    @Autowired
+    private PasswordManager passwordManager;
+
+    @Autowired
+    private VendorClient vendorClient;
+
+    @Autowired
+    private CaseClient caseClient;
+
+    @Autowired
+    private VndSearchEntityAssembler vndSearchEntityAssembler;
+
+    @Autowired
+    private VndSearchUpdateAssembler vndSearchUpdateAssembler;
+
+    @Autowired
+    private DocumentStorageClientService documentStorageClientService;
+
+    @Value("${token.timeout.minutes}")
+    private Long tokenTimeoutInMin;
+
+    @Autowired
+    private RefreshCodeTableValues refreshCodeTableValues;
+
+    @Override
+    public void startWorkflowRequest(final RecordsAnalysisRequestModel recordsAnalysisRequest)
+        throws ValidationException, HttpClientErrorException, HttpServerErrorException, RuntimeException {
+        try {
+            final Integer searchId = recordsAnalysisRequest.getSearchId();
+            LOG.debug(">>>> Starting new workflow request; SearchId: {}", searchId);
+            // (2) Get Search Info
+            final SearchDetails searchDetails = getSearchDetails(searchId);
+
+            if (null == searchDetails) {
+                final ValidationException exception = new ValidationException("validation exception");
+                exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                    ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": no searchDetails found for searchId "
+                        + searchId));
+                throw exception;
+            }
+            // (1) Store Workflow request
+            final SearchWorkflowEntity searchWorkflowEntity = createOrUpdateSearchWorkflowEntity(searchId,
+                searchDetails,
+                recordsAnalysisRequest.getExecutionIds(), requestToDocketDescriptorEntitiesList(recordsAnalysisRequest),
+                WorkflowStatusEnum.READY.toString(), null,
+                null, null, null, null, null, false);
+
+            searchWorkflowEntity.setResearcherType(workfusionResearcherType);
+            searchWorkflowEntity.setVendorId(vendorId);
+            searchWorkflowEntity.setAcknowledged(false);
+            searchWorkflowEntity.setWorkflowUpdateEntities(
+                this.generateUpdateEntities("new workflow created by: " + workfusionResearcherType));
+            final SearchWorkflowResponseEntity searchWorkflowResponseEntity = searchWorkflowClientService
+                .storeWorkflow(searchWorkflowEntity);
+            if (null != searchWorkflowResponseEntity
+                && searchWorkflowResponseEntity.getStatus() == HttpStatus.SC_OK) {
+
+                final WorkerRequestModel workerRequestModel = this.generateWorkerRequestModel(
+                    searchWorkflowResponseEntity.getId(), searchId, null, WorkerActionEnum.POST.toString(), null, null,
+                    null, null);
+
+                publishSQSMessageUtils.publishWorkerMessage(workerRequestModel);
+            }
+
+        } catch (final ValidationException e) {
+            throw e;
+        } catch (final HttpClientErrorException e) {
+            throw e;
+        } catch (final HttpServerErrorException e) {
+            throw e;
+        } catch (final Exception e) {
+            LOG.error("unable to store workflow", e.toString());
+            throw new RuntimeException("unable to store workflow", e);
+        }
+        LOG.debug("<<<< Starting new workflow request end");
+
+    }
+
+    private SearchDetails getSearchDetails(final Integer searchId)
+        throws WorkFusionException, ValidationException {
+        LOG.debug(">>>> getSearchDetails searchId: {}", searchId);
+        final SearchDetails searchDetails = searchInfoClientService.getSearchInfoById(searchId);
+
+        if (null != searchDetails && null != searchDetails.getSearchHeader()) {
+            final ValidationException exception = new ValidationException("validation exception");
+            if (!StringUtils.isEmpty(searchDetails.getSearchHeader().getSearchType())
+                && !searchDetails.getSearchHeader().getSearchType().equalsIgnoreCase("F/M")) {
+                exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                    ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": SearchType is not 'F/M' "));
+            }
+            if (StringUtils.isEmpty(searchDetails.getSearchHeader().getRequestPrintDatetime())) {
+                exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                    ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": RequestPrintDatetime is blank/null "));
+            }
+
+            if (!CollectionUtils.isEmpty(exception.getErrors())) {
+                throw exception;
+            }
+        }
+        LOG.debug("<<<< getSearchDetails ");
+        return searchDetails;
+    }
+
+    @Override
+    public void finishRecordAnalysis(final RecordAnalysisEntity entity) throws ValidationException, Exception {
+        if (null != entity && null != entity.getSearchUpdatesEntity()) {
+            LOG.debug(">>>> Finishing record analysis SearchId: {}", entity.getSearchUpdatesEntity().getSearchId());
+            searchWorkflowClientService.getWorkflowBySearchId(entity.getSearchUpdatesEntity().getSearchId(), null);
+            processFinishRecordAnalysis(entity);
+        }
+        LOG.debug("<<<< Finishing record analysis");
+    }
+
+    private void processFinishRecordAnalysis(RecordAnalysisEntity entity)
+        throws ValidationException {
+        final Integer searchId = this.getSearchId(entity);
+        final String searchStatus = entity.getSearchUpdatesEntity().getSearchStatus();
+        boolean caseNullCheck = true;
+        Integer oin = null;
+        SearchDetails searchDetails = null;
+        final String updateMessage = "Received 'Finish' update with search_status = '" + searchStatus
+            + "' from WorkFusion";
+        LOG.debug(
+            ">>>> processFinishRecordAnalysis searchId: {},searchStatus: {},caseNullCheck: {},oin: {},updateMessage: {}",
+            searchId, searchStatus, caseNullCheck, oin, updateMessage);
+        if (!StringUtils.isEmpty(searchStatus)) {
+            if (searchStatus.equalsIgnoreCase(SearchStatusEnum.OTHER_INFO_NEEDED.getSearchStatus())) {
+                oin = entity.getSearchUpdatesEntity().getOtherInfoNeeded();
+                // Search status P5 means Other information needed
+                // if OIN = 401 (Full DOB Needed in MM/DD/YYYY format)
+                if (null != oin && oin == 401) {
+                    caseNullCheck = true;
+                } else {
+                    final ValidationException exception = new ValidationException("validation exception");
+                    exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                        ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": for oin_note_id = " + oin));
+                    throw exception;
+                }
+            } else if (searchStatus.equals(SearchStatusEnum.PENDING.getSearchStatus())) {
+                caseNullCheck = true;
+            } else if (SearchStatusEnum.isRecordFound(searchStatus)) {
+                caseNullCheck = false;
+            } else if (searchStatus.equals(SearchStatusEnum.NO_RECORD_FOUND.getSearchStatus())) {
+                caseNullCheck = true;
+            } else {
+                final ValidationException exception = new ValidationException("validation exception");
+                exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                    ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": Invalid searchStatus: " + searchStatus
+                    + " for searchId: "
+                    + entity.getSearchUpdatesEntity().getSearchId()));
+                throw exception;
+            }
+            this.validateCaseData(searchStatus, entity, caseNullCheck);
+            entity = this.convertFeedsToFees(entity);
+            final CourtAxisStatus courtAxisStatus = this.generateCourtAxisStatus(entity);
+            searchDetails = this.generateSearchDetails(searchId, searchStatus, oin);
+
+            final SearchWorkflowResponseEntity searchWorkflowResponseEntity = searchWorkflowClientService
+                .updateSearchWorkflow(searchId,
+                    createOrUpdateSearchWorkflowEntity(searchId, searchDetails, null, null, null,
+                        courtAxisStatus, entity, null, null, null, updateMessage, null));
+
+            if (null != searchWorkflowResponseEntity
+                && searchWorkflowResponseEntity.getStatus() == HttpStatus.SC_OK) {
+                final WorkerRequestModel workerRequestModel = this.generateWorkerRequestModel(
+                    searchWorkflowResponseEntity.getId(), searchId, searchStatus,
+                    WorkerActionEnum.REPORT.toString(),
+                    this.convertListNoteEntryEntityToModel(entity.getSearchUpdatesEntity().getInternalNotesAdditions()),
+                    this.convertListNoteEntryEntityToModel(entity.getSearchUpdatesEntity().getResultNotesAdditions()),
+                    null, null);
+
+                try {
+                    publishSQSMessageUtils.publishWorkerMessage(workerRequestModel);
+                } catch (final RequestParserException e) {
+                    // e.printStackTrace();
+                    LOG.error("Unable to publis message: {}", e.getLocalizedMessage());
+                }
+            }
+
+        } else {
+            final ValidationException exception = new ValidationException("validation exception");
+            exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": searchStatus is blank/null for searchId: "
+                    + entity.getSearchUpdatesEntity().getSearchId()));
+            throw exception;
+        }
+        LOG.debug("<<<< processFinishRecordAnalysis");
+    }
+
+    private void validateCaseData(
+        final String searchStatus, final RecordAnalysisEntity entity, final boolean nullCheck
+        )
+            throws ValidationException {
+        LOG.debug(">>>> validateCaseData");
+        if (nullCheck) {
+            if (!CollectionUtils.isEmpty(entity.getCaseDataEntities())) {
+                final ValidationException exception = new ValidationException("validation exception");
+                exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                    ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": case data is not empty for searchStatus = "
+                        + searchStatus));
+                throw exception;
+            }
+        } else {
+            if (CollectionUtils.isEmpty(entity.getCaseDataEntities())) {
+                final ValidationException exception = new ValidationException("validation exception");
+                exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                    ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": case data is empty for searchStatus = "
+                        + searchStatus));
+                throw exception;
+            }
+        }
+        LOG.debug("<<<< validateCaseData");
+    }
+
+    private CourtAxisStatus generateCourtAxisStatus(final RecordAnalysisEntity entity) throws ValidationException {
+        LOG.debug(">>>> generateCourtAxisStatus");
+        final CourtAxisStatus courtAxisStatus = new CourtAxisStatus();
+        courtAxisStatus.setSearchId(this.getSearchId(entity));
+        if (null != entity && null != entity.getSearchUpdatesEntity()) {
+            final String searchStatus = entity.getSearchUpdatesEntity().getSearchStatus();
+            if (!StringUtils.isEmpty(searchStatus)) {
+                if (SearchStatusEnum.isRecordFound(searchStatus)) {
+                    courtAxisStatus.setSubStatusId(25);
+                    courtAxisStatus.setWorkflowMessage("Workfusion Record Found");
+                } else if (searchStatus.equalsIgnoreCase(SearchStatusEnum.NO_RECORD_FOUND.getSearchStatus())) {
+                    courtAxisStatus.setSubStatusId(24);
+                    courtAxisStatus.setWorkflowMessage("Workfusion Not Record Found");
+                } else if (searchStatus.equalsIgnoreCase(SearchStatusEnum.CANCELED.getSearchStatus())
+                    || searchStatus.equalsIgnoreCase(SearchStatusEnum.OTHER_INFO_NEEDED.getSearchStatus())) {
+                    courtAxisStatus.setSubStatusId(26);
+                    courtAxisStatus.setWorkflowMessage("Workfusion cancelled");
+                } else if (searchStatus.equalsIgnoreCase(SearchStatusEnum.PENDING.getSearchStatus())) {
+                    courtAxisStatus.setSubStatusId(24);
+                    courtAxisStatus.setWorkflowMessage("WorkFusion Analysis Completed");
+                }
+            }
+        }
+        LOG.debug("<<<< generateCourtAxisStatus");
+        return courtAxisStatus;
+    }
+
+    private Integer getSearchId(final RecordAnalysisEntity entity) throws ValidationException {
+        LOG.debug(">>>> getSearchId");
+        Integer searchId = null;
+        if (null != entity && null != entity.getSearchUpdatesEntity()) {
+            searchId = entity.getSearchUpdatesEntity().getSearchId();
+        }
+        if (StringUtils.isEmpty(searchId)) {
+            final ValidationException exception = new ValidationException("validation exception");
+            exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": searchId is blank/null"));
+            throw exception;
+        }
+        LOG.debug("<<<< getSearchId");
+        return searchId;
+    }
+
+    @Override
+    public void failRecordAnalysis(
+        final Integer searchId, final WorkflowFailureModel model
+        ) throws ValidationException, NotFoundException, Exception {
+        LOG.debug(">>>> failRecordAnalysis searchId: {}", searchId);
+        searchWorkflowClientService.getWorkflowBySearchId(searchId, null);
+        String searchStatus = null;
+        boolean updateStatus = true;
+        final String updateMessage = "Received 'Fail' update from WorkFusion";
+        if (null != model) {
+            if (StringUtils.isEmpty(model.getSearchStatus())) {
+                updateStatus = false;
+            } else if (!model.getSearchStatus().equalsIgnoreCase(SearchStatusEnum.PENDING.getSearchStatus())
+                && !model.getSearchStatus().equalsIgnoreCase(SearchStatusEnum.OTHER_INFO_NEEDED.getSearchStatus())) {
+                final ValidationException exception = new ValidationException("validation exception");
+                exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                    ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": Invalid searchStatus: "
+                        + model.getSearchStatus() + ", for searchId: " + searchId));
+                throw exception;
+            }
+            searchStatus = model.getSearchStatus();
+            final CourtAxisStatus courtAxisStatus = new CourtAxisStatus();
+            courtAxisStatus.setSearchId(model.getSearchId());
+            // substatus_id = 22 (analysis failed).
+            courtAxisStatus.setSubStatusId(22);
+            courtAxisStatus.setWorkflowMessage(model.getFailReason());
+
+            final SearchDetails searchDetails = updateStatus ? this.generateSearchDetails(searchId, searchStatus, null)
+                : null;
+
+            final SearchWorkflowResponseEntity searchWorkflowResponseEntity = searchWorkflowClientService
+                .updateSearchWorkflow(searchId,
+                    createOrUpdateSearchWorkflowEntity(searchId, searchDetails, null, null, null,
+                        courtAxisStatus, null, null, null, null, updateMessage, null));
+
+            if (null != searchWorkflowResponseEntity
+                && searchWorkflowResponseEntity.getStatus() == HttpStatus.SC_OK) {
+
+                final WorkerRequestModel workerRequestModel = this.generateWorkerRequestModel(
+                    searchWorkflowResponseEntity.getId(), searchId, searchStatus,
+                    WorkerActionEnum.REPORT.toString(), null, null, null, null);
+
+                try {
+                    publishSQSMessageUtils.publishWorkerMessage(workerRequestModel);
+                } catch (final RequestParserException e) {
+                    LOG.error("Unable to publish message: {}", e.getLocalizedMessage());
+                }
+            }
+
+        } else {
+            final ValidationException exception = new ValidationException("validation exception");
+            exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": request model is null"));
+            throw exception;
+        }
+        LOG.debug("<<<< failRecordAnalysis");
+    }
+
+    @Override
+    public void updateAnalysisRequest(
+        final Integer searchId, final SearchHeaderEntity searchHeaderModel
+        ) throws WorkFusionException {
+        LOG.debug(">>>> updateAnalysisRequest");
+        if (null != searchHeaderModel && !StringUtils.isEmpty(searchHeaderModel.getSearchStatus())
+            && searchHeaderModel.getSearchStatus().equalsIgnoreCase("C")) {
+            // Up date courtAxisStatus status to 26
+            final CourtAxisStatus courtAxisStatus = new CourtAxisStatus();
+            courtAxisStatus.setSearchId(searchId);
+            courtAxisStatus.setSubStatusId(26);
+            courtAxisStatus.setWorkflowMessage("WorkFusion canceled");
+            courtClientService.updateSubStatus(searchId, courtAxisStatus);
+        }
+        LOG.debug("<<<< updateAnalysisRequest");
+    }
+
+    @Override
+    public void updateSearchInfo(
+        final Integer searchId, final SearchUpdatesModel model
+        )
+            throws ValidationException, Exception {
+        LOG.debug(">>>> updateSearchInfo searchId: {} ", searchId);
+        if (null != model && model.getSearchId() != null) {
+            searchWorkflowClientService.getWorkflowBySearchId(model.getSearchId(), null);
+            final Integer oin = model.getOtherInfoNeeded();
+            final String searchStatus = model.getSearchStatus();
+            SearchDetails searchDetails = null;
+            String updateMessage = null;
+
+            if (null == model.getSearchId()) {
+                final ValidationException exception = new ValidationException("validation exception");
+                exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                    ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": searchId is null"));
+                throw exception;
+            }
+            // Search status P5 means Other information needed
+            if (!StringUtils.isEmpty(searchStatus)) {
+                // if OIN = 401 (Full DOB Needed in MM/DD/YYYY format)
+                if (searchStatus.equalsIgnoreCase("P5") && null != oin && oin == 411) {
+                    searchDetails = this.generateSearchDetails(model.getSearchId(), searchStatus, oin);
+                } else {
+                    final ValidationException exception = new ValidationException("validation exception");
+                    exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                        ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": for searchStatus :" + searchStatus
+                        + " , oin_note_id: " + oin));
+                    throw exception;
+                }
+            }
+
+            if (!CollectionUtils.isEmpty(model.getInternalNotesAdditions())
+                || !CollectionUtils.isEmpty(model.getResultNotesAdditions())
+                || null != searchDetails
+                || !StringUtils.isEmpty(model.getEta())) {
+
+                updateMessage = this.generateUpdateMessageForUpdateSearchInfo(model.getInternalNotesAdditions(),
+                    model.getResultNotesAdditions(), searchDetails, model.getEta());
+
+                final SearchWorkflowResponseEntity searchWorkflowResponseEntity = searchWorkflowClientService
+                    .updateSearchWorkflow(model.getSearchId(),
+                        createOrUpdateSearchWorkflowEntity(model.getSearchId(), searchDetails, null, null, null,
+                            null, null, null, null, model.getEta(),
+                            updateMessage, null));
+                if (null != searchWorkflowResponseEntity
+                    && searchWorkflowResponseEntity.getStatus() == HttpStatus.SC_OK) {
+
+                    final WorkerRequestModel workerRequestModel = this.generateWorkerRequestModel(
+                        searchWorkflowResponseEntity.getId(), model.getSearchId(), searchStatus,
+                        WorkerActionEnum.UPDATE.toString(), model.getInternalNotesAdditions(),
+                        model.getResultNotesAdditions(), null, model.getEta());
+
+                    publishSQSMessageUtils.publishWorkerMessage(workerRequestModel);
+                }
+            }
+        }
+        LOG.debug("<<<< updateSearchInfo");
+    }
+
+    @Override
+    public void uploadRuleLog(
+        final Integer searchId, final MultipartFile file, final String contentType
+        )
+            throws ValidationException, Exception {
+        LOG.debug(">>>> uploadRuleLog searchId: {} ", searchId);
+        SearchWorkflowEntity searchWorkflowEntity = null;
+        String auditLogDescriptor = null;
+        if (null != searchId) {
+            // Get latest workflow for given searchId if not found throw exception.
+            searchWorkflowEntity = searchWorkflowClientService.getWorkflowBySearchId(searchId, "latest");
+            if (null != searchWorkflowEntity) {
+                final Map<String, String> metadata = new HashMap<>();
+                metadata.put("search_id", searchId.toString());
+                metadata.put("Content-Type", contentType);
+                // Call Document Storage service to upload file to S3 in vendor-integration bucket.'
+                if (StringUtils.isEmpty(workfusionDocumentType)) {
+                    workfusionDocumentType = "workfusion-rule-log";
+                }
+
+                final ResponseEntity<List<DocumentEntity>> dssResponse = documentStorageClientService.upload(
+                    new MultipartFile[] { file }, null, workfusionDocumentType, file.getOriginalFilename(), null,
+                    metadata,
+                    VENDOR_INTEGRATION, null);
+
+                String preSignedS3Url = "";
+                if (null != dssResponse && !CollectionUtils.isEmpty(dssResponse.getBody())
+                    && null != dssResponse.getBody().get(0) && null != dssResponse.getBody().get(0).getId()) {
+                    // Test Url for download File.
+                    // https://dev-int-api.accuratebackground.com:443//v1/dat-documentstorage/documents/5b2cd877450c960008551aa6/file
+                    auditLogDescriptor = dssProtocol + "://" + dssListOfServers + dssContextPath + "/documents/"
+                        + dssResponse.getBody().get(0).getId() + "/file";
+                    // To Which directory file is created.
+                    preSignedS3Url = dssResponse.getBody().get(0).getPreSignedS3Url();
+                }
+                if (!StringUtils.isEmpty(auditLogDescriptor)) {
+                    searchWorkflowEntity.setWorkflowUpdateEntities(
+                        this.generateUpdateEntities("Rule Log file uploaded with preSignedS3Url: " + preSignedS3Url));
+                    searchWorkflowEntity.setAuditlogDescriptor(auditLogDescriptor);
+                    searchWorkflowClientService.updateWorkflow(searchWorkflowEntity.getId(), searchWorkflowEntity);
+                } else {
+                    LOG.error("Could not generate auditLogDescriptor for searchId: {} ", searchId);
+                }
+
+            } else {
+                final NotFoundException exception = new NotFoundException("not found exception");
+                exception.addError(new ErrorModel(ExceptionTypeEnum.RESOURCE_NOT_FOUND.getCode(),
+                    ExceptionTypeEnum.RESOURCE_NOT_FOUND.getMessage()
+                    + ": can not find Active workflow with searchId = " + searchId));
+                throw exception;
+            }
+        } else {
+            final ValidationException exception = new ValidationException("validation exception");
+            exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": searchId is blank/null"));
+            throw exception;
+        }
+        LOG.debug("<<<< uploadRuleLog");
+    }
+
+    public String getRuleLog(Integer searchId) throws NotFoundException,Exception {
+        try {
+            LOG.debug(">>>> getRuleLog searchId: {} ", searchId);
+            if (!StringUtils.isEmpty(searchId)) {
+                SearchWorkflowEntity searchWorkflowEntity = searchWorkflowClientService.getWorkflowBySearchId(searchId,
+                    "latest");
+                if (null != searchWorkflowEntity) {
+                   if(!StringUtils.isEmpty(searchWorkflowEntity.getAuditlogDescriptor())) {
+                    return searchWorkflowEntity.getAuditlogDescriptor();
+                } else {
+                    throw this.notFoundException("The last workflow for search ID does not have a rule log",searchId);
+                }
+                }else {
+                    throw this.notFoundException("No workflow was found for search ID  ",searchId);
+                }
+            } else {
+                throw this.notFoundException("No workflow was found for search ID",searchId);
+            }
+        } catch (HttpClientErrorException e) {
+            throw this.notFoundException("No workflow was found for search ID",searchId);
+        }
+    }
+
+    private NotFoundException notFoundException(String messages,Integer searchId) {
+        final NotFoundException exception = new NotFoundException("not found exception");
+        ErrorModel error= new ErrorModel(ExceptionTypeEnum.RESOURCE_NOT_FOUND.getCode(),
+            messages);
+            error.setParam(String.valueOf(searchId));
+        exception.addError(error);
+        return exception;
+    }
+    
+    private SearchDetails generateSearchDetails(final Integer searchId, final String searchStatus, final Integer oin) {
+        LOG.debug(">>>> generateSearchDetails searchId: {},searchStatus: {},oin: {}", searchId, searchStatus, oin);
+        final SearchHeaderEntity searchHeader = new SearchHeaderEntity();
+        searchHeader.setSearchId(searchId);
+        searchHeader.setSearchStatus(searchStatus);
+        searchHeader.setSearchNoteId(oin);
+        if (!StringUtils.isEmpty(searchStatus) &&
+            searchStatus.equalsIgnoreCase(SearchStatusEnum.NO_RECORD_FOUND.getSearchStatus())) {
+            searchHeader
+            .setResultPrintDatetime(DateConverterUtil.convertISOStringToTimestamp(Instant.now().toString()));
+        }
+        final SearchDetails searchDetails = new SearchDetails();
+        searchDetails.setSearchHeader(searchHeader);
+        LOG.debug("<<<< generateSearchDetails");
+        return searchDetails;
+    }
+
+    public List<DocketDescriptorEntity> requestToDocketDescriptorEntitiesList(
+        final RecordsAnalysisRequestModel recordsAnalysisRequest
+        ) {
+        LOG.debug(">>>> requestToDocketDescriptorEntitiesList");
+        final List<DocketDescriptorEntity> docketDescriptorEntitiesList = new ArrayList<>();
+        for (final DocketDescriptorModel docketDescriptorModel : recordsAnalysisRequest.getDocketDescriptors()) {
+            final DocketDescriptorEntity docketDescriptorEntity = new DocketDescriptorEntity();
+            docketDescriptorEntity.setContentType(docketDescriptorModel.getContentType());
+            docketDescriptorEntity.setFetchUrl(docketDescriptorModel.getFetchUrl());
+            docketDescriptorEntitiesList.add(docketDescriptorEntity);
+        }
+        LOG.debug("<<<< requestToDocketDescriptorEntitiesList");
+        return docketDescriptorEntitiesList;
+    }
+
+    public SearchWorkflowEntity createOrUpdateSearchWorkflowEntity(
+        final Integer searchId,
+        final SearchDetails searchDetails,
+        final List<Integer> executionIds,
+        final List<DocketDescriptorEntity> docketDescriptorEntities,
+        final String flowStatus,
+        final CourtAxisStatus courtAxisStatus,
+        final RecordAnalysisEntity recordAnalysisEntity,
+        final List<WorkflowUpdateEntity> workflowUpdateEntities,
+        final List<NoteUpdateEntity> noteUpdateEntities,
+        final String eta,
+        final String updateMessage,
+        final Boolean activeWorkflow
+        ) throws ValidationException {
+        SearchWorkflowEntity entity = null;
+        LOG.debug(">>>> createOrUpdateSearchWorkflowEntity searchId: {},activeWorkflow: {},eta: {}", searchId,
+            activeWorkflow, eta);
+        if (searchId != null) {
+            entity = new SearchWorkflowEntity();
+            if (recordAnalysisEntity != null) {
+                if (recordAnalysisEntity.getSearchUpdatesEntity() != null &&
+                    recordAnalysisEntity.getSearchUpdatesEntity().getSearchStatus()
+                    .equalsIgnoreCase(SearchStatusEnum.NO_RECORD_FOUND.getSearchStatus())
+                    ||
+                    recordAnalysisEntity.getSearchUpdatesEntity().getSearchStatus()
+                    .equalsIgnoreCase(SearchStatusEnum.RECORD_FOUND.getSearchStatus())) {
+                    final SearchHeaderEntity searchHeader = searchDetails.getSearchHeader();
+                    searchHeader.setResultPrintDatetime(
+                        DateConverterUtil.convertISOStringToTimestamp(Instant.now().toString()));
+                    searchDetails.setSearchHeader(searchHeader);
+                }
+            }
+            entity.setSearchId(searchId);
+            entity.setSearchDetails(searchDetails != null ? searchDetails : null);
+            entity.setExecutionIds(CollectionUtils.isEmpty(executionIds) ? null : executionIds);
+            entity.setDocketDescriptorEntities(
+                CollectionUtils.isEmpty(docketDescriptorEntities) ? null : docketDescriptorEntities);
+            entity.setWorkflowStatus(StringUtils.isEmpty(flowStatus) ? null : flowStatus);
+            entity.setCourtAxisStatus(courtAxisStatus != null ? courtAxisStatus : null);
+            entity.setRecordAnalysisEntity(recordAnalysisEntity != null ? recordAnalysisEntity : null);
+            entity.setWorkflowUpdateEntities(
+                CollectionUtils.isEmpty(workflowUpdateEntities) ? null : workflowUpdateEntities);
+            entity.setNoteUpdateEntities(CollectionUtils.isEmpty(noteUpdateEntities) ? null : noteUpdateEntities);
+            entity.setEta(eta);
+            entity.setWorkflowUpdateEntities(this.generateUpdateEntities(updateMessage));
+            entity.setActiveWorkflow(activeWorkflow);
+            LOG.debug("<<<< createOrUpdateSearchWorkflowEntity");
+            return entity;
+        } else {
+            final ValidationException exception = new ValidationException("validation exception");
+            exception.addError(new ErrorModel(ExceptionTypeEnum.INVALID_VALUE.getCode(),
+                ExceptionTypeEnum.INVALID_VALUE.getMessage() + ": searchId is blank/null"));
+            throw exception;
+        }
+    }
+
+    private List<NoteEntryModel> convertListNoteEntryEntityToModel(final List<NoteEntryEntity> entities) {
+        LOG.debug(">>>> convertListNoteEntryEntityToModel");
+        if (CollectionUtils.isEmpty(entities)) {
+            return null;
+        } else {
+            return entities.stream()
+                .map(entity -> this.convertNoteEntryEntityToModel(entity))
+                .collect(Collectors.toList());
+        }
+    }
+
+    private NoteEntryModel convertNoteEntryEntityToModel(final NoteEntryEntity entity) {
+        LOG.debug(">>>> convertNoteEntryEntityToModel");
+        final NoteEntryModel model = new NoteEntryModel();
+        model.setMessage(entity.getMessage());
+        model.setTimestamp(entity.getTimestamp());
+        model.setUser(entity.getUser());
+        return model;
+    }
+
+    @Override
+    public String authenticateVendor(final String authorization) throws WorkflowForbiddenException, Exception {
+        final HashMap<String, String> hmAuthorization = decode(authorization);
+        try {
+            final String userId = hmAuthorization.get("userID");
+            LOG.debug("Vendor userId =  {}", userId);
+
+            VendorEntity vendorEntity = null;
+            try {
+                vendorEntity = vendorClient.getVendorbyUserID(userId);
+            } catch (final HttpClientErrorException e) {
+                LOG.debug("Vendor not found with userId: {}", userId);
+                final WorkflowForbiddenException ex = new WorkflowForbiddenException(
+                    "Vendor not found / access denied");
+                throw ex;
+            } catch (final HttpServerErrorException e) {
+                throw e;
+            }
+            if (vendorEntity == null || !BooleanUtils.isTrue(vendorEntity.getActive())) {
+                LOG.debug("Vendor not found with userId: {}", userId);
+                final WorkflowForbiddenException ex = new WorkflowForbiddenException(
+                    "Vendor not found / access denied");
+                throw ex;
+            }
+            try {
+                if (!passwordManager.checkPassword(hmAuthorization.get("password"), vendorEntity.getApiPassword())) {
+                    LOG.debug("Password mismatch for userId: {}", userId);
+                    final WorkflowForbiddenException ex = new WorkflowForbiddenException(
+                        "Vendor not found / access denied");
+                    throw ex;
+                }
+            } catch (final IllegalArgumentException e) {
+                final WorkflowForbiddenException ex = new WorkflowForbiddenException(
+                    "Vendor not found with userId: {}" + userId);
+                throw ex;
+            }
+
+            final VenderUpdateApiAndTokenRequestEntity venderUpdateApiAndTokenEntity = this
+                .getOrGenerateToken(vendorEntity);
+            final String xAbcToken = venderUpdateApiAndTokenEntity.getAccessToken();
+            vendorClient.updateVendorbyApiAndToken(vendorEntity.getVendorId(), venderUpdateApiAndTokenEntity);
+            return xAbcToken;
+        } catch (final WorkflowForbiddenException e) {
+            throw e;
+        } catch (final HttpClientErrorException e) {
+            LOG.error("HttpClientErrorException occured", e.toString());
+            throw e;
+        } catch (final HttpServerErrorException e) {
+            LOG.error("HttpServerErrorException occured", e.toString());
+            throw e;
+        } catch (final Exception e) {
+            LOG.error("Unexpected error occurred", e.toString());
+            throw e;
+        }
+    }
+
+    @Override
+    public void registerVendorWebhooks(
+        final Integer vendorID,
+        final WebooksVendorModel model
+        ) {
+        // final VendorEntity vendorEntity = this.validateVendorToken(xAbcToken);
+        vendorClient.updateVendorWebhooks(vendorID, this.webooksVendorModelToEntity(model));
+    }
+
+    private WebhooksVendorRequestEntity webooksVendorModelToEntity(final WebooksVendorModel model) {
+        final WebhooksVendorRequestEntity webhooksVendorRequestEntity = new WebhooksVendorRequestEntity();
+        webhooksVendorRequestEntity.setCanceledSearches(model.getCanceledSearches());
+        webhooksVendorRequestEntity.setModifiedSearches(model.getModifiedSearches());
+        webhooksVendorRequestEntity.setNewSearches(model.getNewSearches());
+        return webhooksVendorRequestEntity;
+    }
+
+    @Override
+    public VndSearchModel getVendorSearchByID(
+        final Integer ID,
+        final Integer vendorID
+        ) throws NotFoundException, Exception {
+        SearchWorkflowEntity searchWorkflowEntity=null;
+        try {
+         searchWorkflowEntity = searchWorkflowClientService
+            .getWorkflowbyVendorSearch(vendorID, ID);
+        if (searchWorkflowEntity == null) {
+            throw new NotFoundException();
+        }
+        }catch (final HttpClientErrorException e) {
+            throw new NotFoundException();
+        }
+        return vndSearchEntityAssembler.assembleEntityToVendorModel(searchWorkflowEntity);
+    }
+
+    @Override
+    public VndSearchResponseModel getVendorSearchesList(
+        final Integer page,
+        final String next,
+        final String acknowledged,
+        final Integer vendorID
+        ) throws Exception {
+        LOG.debug(">>>> getVendorSearchesList page: {},next: {},acknowledged: {},vendorID: {}", page, next,
+            acknowledged, vendorID);
+        final VndSearchResponseModel result = new VndSearchResponseModel();
+        final Integer pageSize = StringUtils.isEmpty(page) ? defaultPage : page;
+        final List<SearchWorkflowEntity> searchWorkflowEntityList = searchWorkflowClientService
+            .getWorkflowsbyVendor(vendorID, pageSize, acknowledged, next);
+        if (CollectionUtils.isEmpty(searchWorkflowEntityList)) {
+            result.setVndSearchModels(Collections.emptyList());
+        } else {
+            result.setVndSearchModels(vndSearchEntityAssembler.assembleEntityToVendorModel(searchWorkflowEntityList));
+            final int searchesFound = searchWorkflowEntityList.size();
+            if (searchesFound >= pageSize) {
+                result.setNext(this.getEncodedString(searchWorkflowEntityList.get(searchesFound - 1).getId()));
+            }
+        }
+        LOG.debug("<<<< getVendorSearchesList ");
+        return result;
+    }
+
+    @Override
+    public UpdateResponseModel updateVendorSearches(
+        final VendorEntity vendorEntity,
+        final VndSearchUpdateRequestModel requestModel
+    ) throws InvalidRequestException {
+        LOG.debug(">>>> updateVendorSearches ");
+        
+        // Don't do general validation checks here: they are done for each search so that error
+        // messages have a search context. Only do unknown-field validation for the outer object.
+        if (!CollectionUtils.isEmpty(requestModel.getUnknownFieldNames())) {
+            throw new InvalidRequestException("Unknown field(s): " +
+                requestModel.getUnknownFieldNames().toString());
+        }
+        
+        if (requestModel == null || CollectionUtils.isEmpty(requestModel.getSearchUpdateModels())) {
+            throw new InvalidRequestException("Request must update at least one search");
+        }
+
+        final List<FailedUpdatesModel> allFailedUpdatesModels = new ArrayList<>();
+        final List<CompletedUpdatesModel> allCompletedUpdatesModel = new ArrayList<>();
+        for (final VndSearchUpdateModel model : requestModel.getSearchUpdateModels()) {
+            attemptVendorSearchUpdate(vendorEntity, allFailedUpdatesModels, allCompletedUpdatesModel, model);
+        }
+
+        final UpdateResponseModel updateResponseModel = new UpdateResponseModel();
+        if (!allFailedUpdatesModels.isEmpty()) {
+            updateResponseModel.setFailedUpdatesModels(allFailedUpdatesModels);
+        }
+        if (!allCompletedUpdatesModel.isEmpty()) {
+            updateResponseModel.setCompletedUpdatesModels(allCompletedUpdatesModel);
+        }
+        LOG.debug("<<<< updateVendorSearches ");
+        return updateResponseModel;
+    }
+
+    private void attemptVendorSearchUpdate(
+        final VendorEntity vendorEntity,
+        final List<FailedUpdatesModel> allFailedUpdatesModels,
+        final List<CompletedUpdatesModel> allCompletedUpdatesModel,
+        final VndSearchUpdateModel model
+        ) {
+        LOG.debug(">>>> attemptVendorSearchUpdate ");
+        final String validateResponse = this.validateSearchUpdateModel(model);
+        if (!StringUtils.isEmpty(validateResponse)) {
+            final FailedUpdatesModel failModel = new FailedUpdatesModel();
+            failModel.setSearchId(model.getSearchId());
+            failModel.setErrorMessage(validateResponse);
+            allFailedUpdatesModels.add(failModel);
+            return;
+        }
+
+        if (!StringUtils.isEmpty(model.getEta())) {
+            model.setAcknowledged(true);
+        }
+
+        SearchDetails searchDetails = null;
+        String workerAction = null;
+        final String searchStatusFromVendor = model.getSearchStatus();
+        if (!StringUtils.isEmpty(searchStatusFromVendor)) {
+            // VI-943: Records Found (F) from external vendors must be translated into Results in Queue (P12) so
+            // that the results are audited in ATM.
+            if (searchStatusFromVendor.equalsIgnoreCase(SearchStatusEnum.RECORD_FOUND.getSearchStatus())) {
+                searchDetails = this.generateSearchDetails(
+                    model.getSearchId(),
+                    SearchStatusEnum.RESULTS_IN_QUEUE.getSearchStatus(),
+                    null);
+            } else {
+                searchDetails = this.generateSearchDetails(model.getSearchId(), searchStatusFromVendor, null);
+            }
+            workerAction = WorkerActionEnum.REPORT.toString();
+        } else if (model.getEta() != null || model.getNoteAdditions() != null) {
+            workerAction = WorkerActionEnum.UPDATE.toString();
+        }
+
+        final String updateMessage = this.generateUpdateMessageForUpdateVendorSearches(model.getNoteAdditions(),
+            searchDetails, model.getEta());
+
+        final SearchWorkflowEntity entity = vndSearchUpdateAssembler
+            .vndSearchUpdateRequestToSearchWorkflowEntityAssembler(
+                model, vendorEntity.getVendorId(), searchDetails);
+        if (null != entity) {
+            entity.setWorkflowUpdateEntities(this.generateUpdateEntities(updateMessage));
+        }
+        try {
+            searchWorkflowClientService.getWorkflowbyVendorSearch(entity.getVendorId(), model.getSearchId());
+            final SearchWorkflowResponseEntity responseEntity = searchWorkflowClientService
+                .updateSearchWorkflow(model.getSearchId(), entity);
+            if (null != responseEntity && responseEntity.getStatus() == HttpStatus.SC_OK) {
+                final CompletedUpdatesModel completedUpdatesModel = new CompletedUpdatesModel();
+                completedUpdatesModel.setSearchId(model.getSearchId());
+                completedUpdatesModel.setMessage(StringUtils.isEmpty(model.getSearchStatus())
+                    ? "This search has been updated"
+                        : "This search has been updated and completed");
+                completedUpdatesModel.setCompleted(!StringUtils.isEmpty(model.getSearchStatus()));
+                allCompletedUpdatesModel.add(completedUpdatesModel);
+
+                if (workerAction != null) {
+                    final WorkerRequestModel workerRequestModel = this.generateWorkerRequestModel(
+                        responseEntity.getId(),
+                        model.getSearchId(),
+                        model.getSearchStatus(),
+                        workerAction,
+                        this.generateInternalNotes(model.getNoteAdditions(), vendorEntity.getVendorName()),
+                        null,
+                        null,
+                        DateConverterUtil.convertDateToYYYYMMDDString(model.getEta()));
+                    try {
+                        publishSQSMessageUtils.publishWorkerMessage(workerRequestModel);
+                    } catch (final RequestParserException e) {
+                        LOG.error("unable to publish update request", e);
+                    }
+                }
+            } else {
+                // TODO: we can't report this to a vendor. What's the error?
+                final FailedUpdatesModel failModel = new FailedUpdatesModel();
+                failModel.setSearchId(model.getSearchId());
+                failModel.setErrorMessage("error message");
+                allFailedUpdatesModels.add(failModel);
+            }
+
+        } catch (final HttpClientErrorException e) {
+            final FailedUpdatesModel failModel = new FailedUpdatesModel();
+            failModel.setSearchId(model.getSearchId());
+            if (null != e.getStatusCode()
+                && e.getStatusCode() == org.springframework.http.HttpStatus.NOT_FOUND) {
+                failModel.setErrorMessage("For Vendor " + vendorEntity.getVendorName() +
+                    " No Active search found for searchId: " + model.getSearchId());
+            } else {
+                failModel.setErrorMessage(e.getStatusText());
+            }
+            allFailedUpdatesModels.add(failModel);
+        } catch (final Exception e) {
+            final FailedUpdatesModel failModel = new FailedUpdatesModel();
+            failModel.setSearchId(model.getSearchId());
+            failModel.setErrorMessage("For Vendor " + vendorEntity.getVendorName() +
+                " Unexpected Exception occurred for searchId: " + model.getSearchId());
+            LOG.error("For Vendor '{}' Unexpected Exception occurred for searchId: {} , Error message {}",
+                vendorEntity.getVendorName(), model.getSearchId(), e.getMessage());
+            allFailedUpdatesModels.add(failModel);
+        }
+    }
+
+    @Override
+    public TableResponseEntity getCodeTable(final String name) {
+        return caseClient.getCodeTable(name);
+    }
+
+    private String validateSearchUpdateModel(final VndSearchUpdateModel model) {
+        LOG.debug(">>>> validateSearchUpdateModel ");
+        final List<String> errorMessages = new ArrayList<>();
+
+        final ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
+        final Validator validator = factory.getValidator();
+        final Set<ConstraintViolation<VndSearchUpdateModel>> violations = validator.validate(model);
+        for (final ConstraintViolation<VndSearchUpdateModel> violation : violations) {
+            errorMessages.add("Validation error: " + violation.getMessage());
+        }
+
+        if (!CollectionUtils.isEmpty(model.getUnknownFieldNames())) {
+            errorMessages.add("Unknown field(s): " + model.getUnknownFieldNames().toString());
+        }
+        
+        if (null == model.getSearchId()) {
+            errorMessages.add("Invalid: search_id is null");
+        }
+        if (!StringUtils.isEmpty(model.getSearchStatus())
+            && !model.getSearchStatus().equalsIgnoreCase(SearchStatusEnum.NO_RECORD_FOUND.getSearchStatus())
+            && !model.getSearchStatus().equalsIgnoreCase(SearchStatusEnum.RECORD_FOUND.getSearchStatus())) {
+            errorMessages
+            .add(String.format("Invalid search_status '%s' for search_id: %d. Allowed values are '%s' or '%s' ",
+                model.getSearchStatus(), model.getSearchId(), SearchStatusEnum.NO_RECORD_FOUND.getSearchStatus(),
+                SearchStatusEnum.RECORD_FOUND.getSearchStatus()));
+        }
+        if (!StringUtils.isEmpty(model.getSearchStatus())
+            && model.getSearchStatus().equalsIgnoreCase(SearchStatusEnum.NO_RECORD_FOUND.getSearchStatus())
+            && !CollectionUtils.isEmpty(model.getCases())) {
+            errorMessages.add(String.format("When search_status is set to '%s', cases must be empty",
+                SearchStatusEnum.NO_RECORD_FOUND.getSearchStatus()));
+        }
+        if (!StringUtils.isEmpty(model.getSearchStatus())
+            && model.getSearchStatus().equalsIgnoreCase(SearchStatusEnum.RECORD_FOUND.getSearchStatus())
+            && CollectionUtils.isEmpty(model.getCases())) {
+            errorMessages.add(String.format("When search_status is set to '%s', one or more cases must be provided",
+                SearchStatusEnum.RECORD_FOUND.getSearchStatus()));
+        }
+        if (model.getAcknowledged() != null
+            && BooleanUtils.isFalse(model.getAcknowledged())) {
+            errorMessages.add(String.format("'acknowledged' cannot be set to 'false'"));
+        }
+        if (!CollectionUtils.isEmpty(model.getNoteAdditions())) {
+            for (String noteAddition : model.getNoteAdditions()) {
+                if (noteAddition == null || StringUtils.isEmpty(noteAddition.trim())) {
+                    errorMessages.add(String.format("A note_additions value cannot be null/blank",
+                        model.getSearchId()));
+                    break;  // Only need to report this error once.
+                }
+            }
+        }
+
+        if (errorMessages.isEmpty() && !CollectionUtils.isEmpty(model.getCases())) {
+            model.getCases().forEach(caseData -> validateCaseData(caseData, errorMessages));
+        }
+        LOG.debug("<<<< validateSearchUpdateModel ");
+        return errorMessages.stream().collect(Collectors.joining("; "));
+    }
+
+    private void validateCaseData(
+        final VndCaseDataModel caseData,
+        final List<String> errorMessages
+    ) {
+        LOG.debug(">>>> validateCaseData ");
+        
+        final String caseNumber =
+            caseData.getCaseNumber() == null ? "<unknown>" : caseData.getCaseNumber();
+        final ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
+        final Validator validator = factory.getValidator();
+        final Set<ConstraintViolation<VndCaseDataModel>> violations = validator.validate(caseData);
+        for (final ConstraintViolation<VndCaseDataModel> violation : violations) {
+            errorMessages.add(String.format("Validation error for case number %s: %s",
+                caseNumber, violation.getMessage()));
+        }
+
+        if (!CollectionUtils.isEmpty(caseData.getUnknownFieldNames())) {
+            errorMessages.add(String.format("Unknown case_data field(s) for case number %s: %s",
+                caseNumber, caseData.getUnknownFieldNames().toString()));
+        }
+        
+        if (caseData.getCaseDisposition() != null &&
+            !refreshCodeTableValues.isSetContains(
+                RefreshCodeTableValues.DISPOSITION_CODES, caseData.getCaseDisposition())) {
+            errorMessages.add(String.format("Invalid %s disposition_code: %d for case_number: %s",
+                LEVEL_CASE, caseData.getCaseDisposition(), caseNumber));
+        }
+        if (caseData.getVndCriminalSentenceModel() != null) {
+            validateCriminalSentence(caseData.getVndCriminalSentenceModel(), errorMessages,
+                LEVEL_CASE, caseNumber);
+        }
+        if (!CollectionUtils.isEmpty(caseData.getVndCriminalAdditionModel())) {
+            caseData.getVndCriminalAdditionModel()
+                .forEach(crimAddl -> validateCriminalAddition(crimAddl, errorMessages,
+                    LEVEL_CASE, caseNumber));
+        }
+        if (!CollectionUtils.isEmpty(caseData.getVndCriminalChargeModel())) {
+            caseData.getVndCriminalChargeModel()
+                .forEach(crimCharge -> validateCriminalCharge(crimCharge, errorMessages, caseNumber));
+        }
+        LOG.debug("<<<< validateCaseData ");
+    }
+
+    private void validateCriminalAddition(
+        final VndCriminalAdditionModel criminalAddition,
+        final List<String> errorMessages,
+        final String fieldLevel,
+        final String caseNumber
+    ) {
+        LOG.debug(">>>> validateCriminalAddition fieldLevel: {}, caseNumber: {}", fieldLevel, caseNumber);
+        
+        final ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
+        final Validator validator = factory.getValidator();
+        final Set<ConstraintViolation<VndCriminalAdditionModel>> violations = validator.validate(criminalAddition);
+        for (final ConstraintViolation<VndCriminalAdditionModel> violation : violations) {
+            errorMessages.add(String.format("%s addition validation error for case number %s: %s",
+                fieldLevel, caseNumber, violation.getMessage()));
+        }
+
+        if (!CollectionUtils.isEmpty(criminalAddition.getUnknownFieldNames())) {
+            errorMessages.add(String.format("Unknown %s addition field(s) for case number %s: %s",
+                fieldLevel, caseNumber, criminalAddition.getUnknownFieldNames().toString()));
+        }
+        
+        if (criminalAddition.getAdditionTypeId() != null &&
+            !refreshCodeTableValues.isSetContains(RefreshCodeTableValues.ADDITION_TYPE_CODES,
+                criminalAddition.getAdditionTypeId())) {
+            errorMessages.add(
+                String.format("Invalid %s addition_type_id: %d for case_number: %s", fieldLevel,
+                    criminalAddition.getAdditionTypeId(), caseNumber));
+        }
+        if (criminalAddition.getAdditionActionId() != null &&
+            !refreshCodeTableValues.isSetContains(RefreshCodeTableValues.ACTION_TYPE_CODES,
+                criminalAddition.getAdditionActionId())) {
+            errorMessages.add(String.format("Invalid %s addition_action_id: %d for case_number: %s",
+                fieldLevel, criminalAddition.getAdditionActionId(), caseNumber));
+        }
+        LOG.debug("<<<< validateCriminalAddition ");
+    }
+
+    private void validateCriminalCharge(
+        final VndCriminalChargeModel crimCharge,
+        final List<String> errorMessages,
+        final String caseNumber
+    ) {
+        LOG.debug(">>>> validateCriminalCharge caseNumber: {}", caseNumber);
+        
+        final ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
+        final Validator validator = factory.getValidator();
+        final Set<ConstraintViolation<VndCriminalChargeModel>> violations = validator.validate(crimCharge);
+        for (final ConstraintViolation<VndCriminalChargeModel> violation : violations) {
+            errorMessages.add(String.format("Criminal charge validation error for case number %s: %s",
+                caseNumber, violation.getMessage()));
+        }
+
+        if (!CollectionUtils.isEmpty(crimCharge.getUnknownFieldNames())) {
+            errorMessages.add(String.format("Unknown criminal charge field(s) for case number %s: %s",
+                caseNumber, crimCharge.getUnknownFieldNames().toString()));
+        }
+        
+        if (crimCharge.getChargeLevel() != null &&
+            !refreshCodeTableValues.isSetContains(RefreshCodeTableValues.CHARGE_LEVELS_CODES,
+                crimCharge.getChargeLevel())) {
+            errorMessages.add(String.format("Invalid %s charge_level: %d for case_number: %s",
+                LEVEL_CRIMINAL_CHARGE, crimCharge.getChargeLevel(), caseNumber));
+        }
+        if (crimCharge.getChargeDispostion() != null &&
+            !refreshCodeTableValues.isSetContains(RefreshCodeTableValues.DISPOSITION_CODES,
+                crimCharge.getChargeDispostion())) {
+            errorMessages.add(String.format("Invalid %s charge_disposition: %d for case_number: %s",
+                LEVEL_CRIMINAL_CHARGE, crimCharge.getChargeDispostion(), caseNumber));
+        }
+        if (!CollectionUtils.isEmpty(crimCharge.getCriminalSentence())) {
+            crimCharge.getCriminalSentence().forEach(
+                crimSent -> validateCriminalSentence(crimSent, errorMessages, LEVEL_CRIMINAL_CHARGE, caseNumber));
+        }
+        if (!CollectionUtils.isEmpty(crimCharge.getCriminalAddition())) {
+            crimCharge.getCriminalAddition().forEach(
+                crimAddl -> validateCriminalAddition(crimAddl, errorMessages, LEVEL_CRIMINAL_CHARGE, caseNumber));
+        }
+        LOG.debug("<<<< validateCriminalCharge ");
+    }
+
+    private void validateCriminalSentence(
+        final VndCriminalSentenceModel criminalSentence,
+        final List<String> errorMessages,
+        final String fieldLevel,
+        final String caseNumber
+    ) {
+        LOG.debug(">>>> validateCriminalSentence fieldLevel: {}, caseNumber: {}", fieldLevel, caseNumber);
+        
+        final ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
+        final Validator validator = factory.getValidator();
+        final Set<ConstraintViolation<VndCriminalSentenceModel>> violations =
+            validator.validate(criminalSentence);
+        for (final ConstraintViolation<VndCriminalSentenceModel> violation : violations) {
+            errorMessages.add(String.format("Criminal sentence %s validation error for case number %s: %s",
+                fieldLevel, caseNumber, violation.getMessage()));
+        }
+
+        if (!CollectionUtils.isEmpty(criminalSentence.getUnknownFieldNames())) {
+            errorMessages.add(String.format("Unknown %s sentence field(s) for case number %s: %s",
+                fieldLevel, caseNumber, criminalSentence.getUnknownFieldNames().toString()));
+        }
+        
+        if (criminalSentence.getProbationTypeId() != null &&
+            !refreshCodeTableValues.isSetContains(RefreshCodeTableValues.PROBATION_TYPE_CODES,
+                criminalSentence.getProbationTypeId())) {
+            errorMessages.add(String.format("Invalid %s probation_type_id: %d for case_number: %s",
+                fieldLevel, criminalSentence.getProbationTypeId(), caseNumber));
+        }
+        LOG.debug("<<<< validateCriminalSentence ");
+    }
+
+    private VenderUpdateApiAndTokenRequestEntity getOrGenerateToken(final VendorEntity vendorEntity) {
+        LOG.debug(">>>> getOrGenerateToken ");
+        final VenderUpdateApiAndTokenRequestEntity vendorUpdateApiAndTokenEntity = new VenderUpdateApiAndTokenRequestEntity();
+        vendorUpdateApiAndTokenEntity.setTokenExpiration(new Date());
+        if (StringUtils.isEmpty(vendorEntity.getAccessToken()) || tokenHasExpired(vendorEntity)) {
+            vendorUpdateApiAndTokenEntity.setAccessToken(UUID.randomUUID().toString());
+        } else {
+            vendorUpdateApiAndTokenEntity.setAccessToken(vendorEntity.getAccessToken());
+        }
+        LOG.debug("<<<< getOrGenerateToken ");
+        return vendorUpdateApiAndTokenEntity;
+    }
+
+    private boolean tokenHasExpired(final VendorEntity vendorEntity) {
+        try {
+            return StringUtils.isEmpty(vendorEntity.getTokenExpiration()) ||
+                minutesBeforeNow(vendorEntity.getTokenExpiration()) > tokenTimeoutInMin;
+        } catch (final ParseException e) {
+            // If this occurs, the vendor's token expiration field is in the wrong format. Log this and treat it as
+            // though the token expired.
+            LOG.error("Vendor token_expiration could not be parsed: " + vendorEntity.getTokenExpiration(), e);
+            return true;
+        }
+    }
+
+    private long minutesBeforeNow(final String dateInString) throws ParseException {
+        final SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss");
+        final Date date = formatter.parse(dateInString);
+        return (new Date().getTime() - date.getTime()) / MILLIS_IN_ONE_MINUTE;
+    }
+
+    private HashMap<String, String> decode(final String authString) throws WorkflowForbiddenException {
+        LOG.debug(">>>> decode authString: {}", authString);
+        final HashMap<String, String> hmap = new HashMap<>();
+        final WorkflowForbiddenException exception = new WorkflowForbiddenException();
+        boolean throwException = true;
+        if (null != authString) {
+            final String[] arrAccCode = authString.split("\\s");
+            if (null != arrAccCode && arrAccCode.length >= 2) {
+                final String accCode = authString.split("\\s")[1];
+                final String strUserDetails = this.getDecodedString(accCode);
+                if (!StringUtils.isEmpty(strUserDetails)) {
+                    final String[] arrUserDetails = strUserDetails.split(":");
+                    if (null != arrUserDetails && arrUserDetails.length >= 2) {
+                        if (!StringUtils.isEmpty(arrUserDetails[0])) {
+                            hmap.put("userID", arrUserDetails[0]);
+                            hmap.put("password", arrUserDetails[1]);
+                            throwException = false;
+                        }
+                    }
+                }
+            }
+        }
+
+        if (throwException) {
+            throw exception;
+        }
+        LOG.debug("<<<< decode");
+        return hmap;
+    }
+
+    private WorkerRequestModel generateWorkerRequestModel(
+        final String workflowId, final Integer searchId,
+        final String searchStatus, final String workerAction,
+        final List<NoteEntryModel> internalNotes,
+        final List<NoteEntryModel> resultNotes,
+        final List<NoteEntryModel> clientNotes, final String eta
+        ) {
+        LOG.debug(">>>> generateWorkerRequestModel searchId: {},workerAction: {},eta: {}", searchId, workerAction, eta);
+        final WorkerRequestModel workerRequestModel = new WorkerRequestModel();
+        workerRequestModel.setWorkflowId(workflowId);
+        workerRequestModel.setSearchId(searchId);
+        workerRequestModel.setWorkerAction(workerAction);
+        workerRequestModel.setSearchStatus(searchStatus);
+        workerRequestModel.setInternalNotes(internalNotes);
+        workerRequestModel.setResultNotes(resultNotes);
+        workerRequestModel.setClientNotes(clientNotes);
+        workerRequestModel.setEta(eta);
+        workerRequestModel.setWorkerTimeStamp(new Date());
+        LOG.debug("<<<< generateWorkerRequestModel");
+        return workerRequestModel;
+    }
+
+    @Override
+    public VendorEntity validateVendorToken(final String xAbcToken) throws WorkflowForbiddenException, UnauthorizedException {
+        LOG.debug(">>>> validateVendorToken xAbcToken: {}", xAbcToken);
+        VendorEntity vendorEntity = null;
+        if (!StringUtils.isEmpty(xAbcToken)) {
+            try {
+                vendorEntity = vendorClient.getVendorbyToken(xAbcToken);
+            } catch (final HttpClientErrorException e) {
+                // Vendor not found exception; turn into 403 error
+                LOG.debug(" HttpClientErrorException while vendorClient.getVendorbyToken for token: {}", xAbcToken);
+                final WorkflowForbiddenException ex = new WorkflowForbiddenException("Token not found");
+                throw ex;
+            }
+        }else {
+            LOG.error("xAbcToken is token is required");
+            final UnauthorizedException ex = new UnauthorizedException("Request is missing the required header 'x-abc-token'");
+            throw ex;
+        }
+        if (vendorEntity == null || tokenHasExpired(vendorEntity) || !vendorEntity.getActive()) {
+            LOG.error("Invalid token: {}, no active vendor found for", xAbcToken);
+            final WorkflowForbiddenException ex = new WorkflowForbiddenException("Vendor not found / access denied");
+            throw ex;
+        }
+        LOG.debug("<<<< validateVendorToken");
+        return vendorEntity;
+    }
+
+    @Override
+    public void updateTritonMVRSearch(
+        final Integer searchId, final VendorEntity vendorEntity ,final TritonMVRPackageResultModel tritonMVRPackageResultModel
+        ) throws NotFoundException, Exception {
+        SearchWorkflowEntity searchWorkflowEntity = null;
+        LOG.debug(">>>> updateTritonMVRSearch searchId: {}", searchId);
+        try {
+            if (searchId != null) {
+                searchWorkflowEntity= searchWorkflowClientService.getWorkflowByOrderIdAndVendorID(tritonMVRPackageResultModel.getExternalUniqueId(), vendorEntity.getVendorId());
+                if (searchWorkflowEntity != null) {
+                    final String resultId = tritonMVRPackageResultModel.getServices().get(0).getServiceId();
+                    if (!StringUtils.isEmpty(resultId)) {
+                        final SearchDetails searchDetails = searchWorkflowEntity.getSearchDetails();
+                        final SearchHeaderEntity searchHeaderEntity = searchDetails.getSearchHeader();
+                            searchHeaderEntity.setSearchStatus(SearchStatusEnum.COMPLETE.getSearchStatus());
+                        searchDetails.setSearchHeader(searchHeaderEntity);
+                       //TODO MVR Result object
+                        MvrResultsEntity mvrResults=new MvrResultsEntity();
+//                        mvrResults.setOrderNumber(tritonMVRPackageResultModel.getConfirmationId());
+                        searchWorkflowEntity.setMvrResults(mvrResults);
+                        searchWorkflowEntity.setSearchDetails(searchDetails);
+                        searchWorkflowClientService.updateWorkflow(searchWorkflowEntity.getSearchId()+"", searchWorkflowEntity);
+                        final WorkerRequestModel workerRequestModel = this.generateWorkerRequestModel(
+                            searchWorkflowEntity.getId(),
+                            searchWorkflowEntity.getSearchId(),
+                            searchWorkflowEntity.getWorkflowStatus(),
+                            WorkerActionEnum.POST.toString(),
+                            null,
+                            null,
+                            null,
+                            null);
+                        try {
+                            publishSQSMessageUtils.publishWorkerMessage(workerRequestModel);
+                        } catch (final RequestParserException e) {
+                            LOG.error("unable to publish update request", e);
+                        }
+                    } else {
+                        throw this.throwNotfound(searchId+"");
+                    }
+                } else {
+                    throw this.throwNotfound(searchId+"");
+                }
+            } else {
+                throw this.throwNotfound(searchId+"");
+            }
+        } catch (final NotFoundException e) {
+            throw e;
+        }
+    }
+
+   
+
+    private NotFoundException throwNotfound(final String searchId) {
+        final NotFoundException exception = new NotFoundException("not found exception");
+        exception.addError(new ErrorModel(ExceptionTypeEnum.RESOURCE_NOT_FOUND.getCode(),
+            ExceptionTypeEnum.RESOURCE_NOT_FOUND.getMessage()
+            + ": can not find searchId = " + searchId));
+        return exception;
+    }
+
+    private String getEncodedString(final String strValue) {
+        if (!StringUtils.isEmpty(strValue)) {
+            return Base64.getEncoder().encodeToString(strValue.getBytes(StandardCharsets.UTF_8));
+        }
+        return null;
+    }
+
+    private List<NoteEntryModel> generateInternalNotes(final List<String> notesAdditional, final String user) {
+        List<NoteEntryModel> alEntryModels = null;
+        if (!CollectionUtils.isEmpty(notesAdditional)) {
+            alEntryModels = new ArrayList<>();
+            for (final String notes : notesAdditional) {
+                final NoteEntryModel model = new NoteEntryModel();
+                model.setMessage(notes);
+                model.setTimestamp(DateConverterUtil.getSystemISODate());
+                model.setUser(user);
+                alEntryModels.add(model);
+            }
+        }
+        return alEntryModels;
+    }
+
+    private String getDecodedString(final String strValue) {
+        if (!StringUtils.isEmpty(strValue)) {
+            try {
+                return new String(Base64.getDecoder().decode(strValue), StandardCharsets.UTF_8);
+            } catch (final Exception e) {
+                LOG.error("unable to decode str value: " + strValue);
+                return null;
+            }
+        }
+        return null;
+    }
+
+    private List<WorkflowUpdateEntity> generateUpdateEntities(final String updateMessage) {
+        final WorkflowUpdateEntity workflowUpdateEntity = new WorkflowUpdateEntity();
+        workflowUpdateEntity.setSummary(updateMessage);
+        workflowUpdateEntity.setUpdateStamp(new Date());
+
+        final List<WorkflowUpdateEntity> workflowUpdateEntities = new ArrayList<>();
+        workflowUpdateEntities.add(workflowUpdateEntity);
+
+        return workflowUpdateEntities;
+    }
+
+    private String generateUpdateMessageForUpdateSearchInfo(
+        final List<NoteEntryModel> internalNotes, final List<NoteEntryModel> resultNotes,
+        final SearchDetails searchDetails, final String eta
+        ) {
+        final StringBuilder sb = new StringBuilder("Updated with ");
+        if (!CollectionUtils.isEmpty(internalNotes)) {
+            sb.append(" internalNotes ");
+        }
+        if (!CollectionUtils.isEmpty(resultNotes)) {
+            sb.append(" , resultNotes ");
+        }
+        if (null != searchDetails) {
+            sb.append(" , searchStatus , OIN ");
+        }
+        if (StringUtils.isEmpty(eta)) {
+            sb.append(" , eta ");
+        }
+
+        return sb.toString();
+    }
+
+    private String generateUpdateMessageForUpdateVendorSearches(
+        final List<String> notes, final SearchDetails searchDetails, final Date eta
+        ) {
+        final StringBuilder sb = new StringBuilder("Updated with ");
+        if (!CollectionUtils.isEmpty(notes)) {
+            sb.append(" notes ");
+        }
+        if (null != searchDetails) {
+            sb.append(" , searchStatus , OIN ");
+        }
+        if (null != eta) {
+            sb.append(" , eta ");
+        }
+
+        return sb.toString();
+    }
+
+    private RecordAnalysisEntity convertFeedsToFees(final RecordAnalysisEntity entity) {
+        LOG.debug(">>>> convertFeedsToFees");
+        if (null != entity && !CollectionUtils.isEmpty(entity.getCaseDataEntities())) {
+            for (final CaseDataEntity caseEntity : entity.getCaseDataEntities()) {
+                if (null != caseEntity) {
+                    if (null != caseEntity.getCaseSentence()) {
+                        caseEntity.getCaseSentence().setFees(this.convertFeedsToFees(
+                            caseEntity.getCaseSentence().getFees(), caseEntity.getCaseSentence().getFeeds()));
+                    }
+                    if (!CollectionUtils.isEmpty(caseEntity.getCriminalChargesEntities())) {
+                        for (final CriminalChargesEntity chargesEntity : caseEntity.getCriminalChargesEntities()) {
+                            if (null != chargesEntity
+                                && !CollectionUtils.isEmpty(chargesEntity.getCriminalSentenceEntities())) {
+                                for (final CriminalSentenceEntity sentenceEntity : chargesEntity
+                                    .getCriminalSentenceEntities()) {
+                                    if (null != sentenceEntity) {
+                                        sentenceEntity.setFees(this.convertFeedsToFees(sentenceEntity.getFees(),
+                                            sentenceEntity.getFeeds()));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        LOG.debug("<<<< convertFeedsToFees");
+        return entity;
+    }
+
+    private String convertFeedsToFees(final String fees, final String feeds) {
+        if (StringUtils.isEmpty(fees) && !StringUtils.isEmpty(feeds)) {
+            return feeds;
+        }
+        return fees;
+    }
+
+    @Override
+    public String getPasswordHash(final String password) {
+        final String hash = passwordManager.hash(password);
+        return hash;
+    }
+
+}
